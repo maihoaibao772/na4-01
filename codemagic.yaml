@@ -575,23 +575,36 @@ workflows:
           rm -f "$ROOT/out_ipa"/*.idx
 
           if [ "$UPLOAD_GOFILE" = "true" ]; then
-            SERVERS="$(curl -s --retry 3 https://api.gofile.io/servers | jq -r '.data.servers[].name' | head -n 3)"
+            GF_AUTH=()
+            if [ -n "${GOFILE_TOKEN:-}" ]; then GF_AUTH=(-H "Authorization: Bearer ${GOFILE_TOKEN}"); fi
+            SERVERS="$(curl -s --retry 3 https://api.gofile.io/servers | jq -r '.data.servers[].name' | head -n 3 || true)"
             for f in "$ROOT/out_ipa"/*.ipa "$ROOT/out_ipa"/*.img; do
               if [ -f "$f" ]; then
                 FSIZE="$(ls -lh "$f" | awk '{print $5}')"
                 LINK=""
-                for srv in $SERVERS; do
-                  for attempt in 1 2 3; do
-                    RESP="$(curl -f -sS --max-time 5400 -F "file=@${f}" "https://${srv}.gofile.io/contents/uploadfile" 2>/dev/null || true)"
-                    CAND="$(echo "$RESP" | jq -r '.data.downloadPage // empty' 2>/dev/null || true)"
-                    if [ -n "$CAND" ]; then
-                      LINK="$CAND"
-                      break
-                    fi
-                    sleep 5
-                  done
-                  [ -n "$LINK" ] && break
+                for attempt in 1 2 3; do
+                  RESP="$(curl -f -sS --max-time 5400 "${GF_AUTH[@]}" -F "file=@${f}" "https://upload.gofile.io/uploadfile" 2>/dev/null || true)"
+                  CAND="$(echo "$RESP" | jq -r '.data.downloadPage // empty' 2>/dev/null || true)"
+                  if [ -n "$CAND" ]; then
+                    LINK="$CAND"
+                    break
+                  fi
+                  sleep 5
                 done
+                if [ -z "$LINK" ]; then
+                  for srv in $SERVERS; do
+                    for attempt in 1 2 3; do
+                      RESP="$(curl -f -sS --max-time 5400 "${GF_AUTH[@]}" -F "file=@${f}" "https://${srv}.gofile.io/contents/uploadfile" 2>/dev/null || true)"
+                      CAND="$(echo "$RESP" | jq -r '.data.downloadPage // empty' 2>/dev/null || true)"
+                      if [ -n "$CAND" ]; then
+                        LINK="$CAND"
+                        break
+                      fi
+                      sleep 5
+                    done
+                    [ -n "$LINK" ] && break
+                  done
+                fi
                 if [ -n "$LINK" ]; then
                   echo "Uploaded $(basename "$f") (${FSIZE}) -> ${LINK}"
                 else
