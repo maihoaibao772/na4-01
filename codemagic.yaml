@@ -431,23 +431,17 @@ workflows:
             (cd "$ROOT/src" && python3 dm/gfx/tools/dmsh_chain.py --update-lock) || true
           fi
 
-          cat > "$ROOT/miao_env.txt" <<EOF
-          DM_ALIAS_SIZE=0x180000000
-          EOF
-
           ENT_ENV=""
           if [ -f "$ROOT/entitlements.plist" ]; then ENT_ENV="DM_ENTITLEMENTS=$ROOT/entitlements.plist"; fi
           ROMFS_ARGS="--romfs separate"
           if [ "$PACKAGING_MODE" = "bundle" ]; then ROMFS_ARGS=""; fi
 
           HELP_OUT="$(cd "$ROOT/src" && python3 scripts/build_ipa_from_nsp.py --help 2>&1 || true)"
-          NO_HEAP_ARG=""; echo "$HELP_OUT" | grep -q -- "--no-heap-check" && NO_HEAP_ARG="--no-heap-check"
           KEEP_EXT_ARG=""; echo "$HELP_OUT" | grep -q -- "--keep-extracted" && KEEP_EXT_ARG="--keep-extracted"
-          ENV_FILE_ARG=""; echo "$HELP_OUT" | grep -q -- "--env-file" && ENV_FILE_ARG="--env-file $ROOT/miao_env.txt"
 
           run_nx_build() {
             (cd "$ROOT/src" && env $ENT_ENV python3 scripts/build_ipa_from_nsp.py "$ROOT/game_files" \
-              -k "$PROD_KEYS" --allow-other-metal $NO_HEAP_ARG $KEEP_EXT_ARG $ENV_FILE_ARG $ROMFS_ARGS -o "$ROOT/out_ipa/$IPA_NAME")
+              -k "$PROD_KEYS" --allow-other-metal $KEEP_EXT_ARG $ROMFS_ARGS -o "$ROOT/out_ipa/$IPA_NAME")
           }
 
           run_nx_build
