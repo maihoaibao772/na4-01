@@ -89,7 +89,7 @@ workflows:
 
           # 1. Smart A16 Auto-Patch
           if [ "$CHIP_PRESET" = "under_a17" ]; then
-            if [ -f "src/dm/gfx/tex/bc_soft.c" ] || [ -f "src/dm/gfx/tex/nvn_bcdec.c" ]; then
+            if [ -f "src/dm/gfx/tex/bc_soft.c" ] || [ -f "src/dm/gfx/tex/nvn_bcdec.c" ] || grep -rq "DM_PROF_TEX_BC_CPU" src/dm/gfx/ 2>/dev/null; then
               echo "[A16 SMART] Engine đã tích hợp sẵn giải mã BC mềm cho A16."
             else
               echo "[A16 SMART] Kéo bộ giải mã ASTC (bc_soft) từ NXNativeWindows..."
@@ -387,27 +387,55 @@ workflows:
 
           download_any "$KEYS_URL" "keys_dir" "true"
           download_any "$GAME_URL" "game_files" "true"
-          if [ "$USE_UPDATE" = "true" ] && [ -n "$UPDATE_URL" ]; then download_any "$UPDATE_URL" "game_files" "true"; fi
           while IFS= read -r -d '' arc; do
             extract_archive "$arc" "game_files"
           done < <(find game_files -maxdepth 2 -type f \( -iname "*.zip" -o -iname "*.rar" -o -iname "*.7z" \) -print0)
           find game_files -mindepth 2 -type f -exec mv -f {} game_files/ \;
           find game_files -mindepth 1 -type d -empty -delete
+
+          if [ "$USE_UPDATE" = "true" ] && [ -n "$UPDATE_URL" ]; then
+            mkdir -p update_raw
+            download_any "$UPDATE_URL" "update_raw" "false"
+            if find update_raw -type f -iname "*dlc*" | grep -q .; then
+              echo "[UPDATE WARN] Phát hiện file chứa chữ 'DLC' trong UPDATE_URL — hãy kiểm tra xem bạn có dán nhầm link DLC vào ô UPDATE_URL không!"
+            fi
+            while IFS= read -r -d '' arc; do
+              extract_archive "$arc" "update_raw"
+            done < <(find update_raw -maxdepth 3 -type f \( -iname "*.zip" -o -iname "*.rar" -o -iname "*.7z" \) -print0)
+            UPD_COUNT="$(find update_raw -type f \( -iname "*.nsp" -o -iname "*.xci" -o -iname "*.nsz" -o -iname "*.xcz" \) | wc -l | tr -d ' ')"
+            echo "[UPDATE PRE-CHECK] Found $UPD_COUNT update file(s)."
+            if [ "$UPD_COUNT" -eq 0 ]; then
+              echo "[UPDATE ERROR] USE_UPDATE=true nhưng không tìm thấy file .nsp/.xci/.nsz/.xcz nào trong UPDATE_URL!"
+              exit 1
+            fi
+            find update_raw -type f \( -iname "*.nsp" -o -iname "*.xci" -o -iname "*.nsz" -o -iname "*.xcz" \) -exec mv -f {} game_files/ \;
+            rm -rf update_raw
+          fi
+
           if [ "$USE_DLC" = "true" ] && [ -n "$DLC_URL" ]; then
             mkdir -p dlc_raw
             download_any "$DLC_URL" "dlc_raw" "false"
             while IFS= read -r -d '' arc; do
               extract_archive "$arc" "dlc_raw"
             done < <(find dlc_raw -maxdepth 3 -type f \( -iname "*.zip" -o -iname "*.rar" -o -iname "*.7z" \) -print0)
+            DLC_COUNT="$(find dlc_raw -type f \( -iname "*.nsp" -o -iname "*.xci" -o -iname "*.nsz" -o -iname "*.xcz" \) | wc -l | tr -d ' ')"
+            echo "[DLC PRE-CHECK] Found $DLC_COUNT DLC file(s)."
             find dlc_raw -type f \( -iname "*.nsp" -o -iname "*.xci" -o -iname "*.nsz" -o -iname "*.xcz" \) -exec mv -f {} game_files/ \;
             rm -rf dlc_raw
           fi
+
           if [ "$USE_VH" = "true" ] && [ -n "$VH_URL" ]; then
             download_any "$VH_URL" "vh_raw" "false"
             mkdir -p vh_raw/unpacked
             while IFS= read -r -d '' arc; do
               extract_archive "$arc" "vh_raw/unpacked"
             done < <(find vh_raw -maxdepth 3 -type f \( -iname "*.zip" -o -iname "*.rar" -o -iname "*.7z" \) -print0)
+            VH_COUNT="$(find vh_raw -type f ! -name "._*" ! -name ".DS_Store" ! -iname "*.zip" ! -iname "*.rar" ! -iname "*.7z" | wc -l | tr -d ' ')"
+            echo "[VH PRE-CHECK] Found $VH_COUNT unpacked localization file(s)."
+            if [ "$VH_COUNT" -eq 0 ]; then
+              echo "[VH ERROR] USE_VH=true nhưng không tìm thấy file Việt hóa hợp lệ nào trong vh_raw!"
+              exit 1
+            fi
           fi
           df -h /
 
@@ -446,6 +474,42 @@ workflows:
 
           run_nx_build
           rm -f "$ROOT/.need_repack"
+
+          # Tự động vá profile tạm Unreal Engine (>6 GB) để tránh lỗi FATAL reserve guest AS trên iPhone (nxnative#2278)
+          python3 - <<'PY'
+          import os, glob
+          root = os.environ["ROOT"]
+          IOS_LIMIT = 0x180000000
+          for tsv in glob.glob(os.path.join(root, "game_files", "*_build", "profile", "*", "game.tsv")):
+              lines = open(tsv, encoding="utf-8").read().splitlines()
+              vals = {}
+              for ln in lines:
+                  s = ln.strip()
+                  if s and not s.startswith("#"):
+                      parts = s.split()
+                      if len(parts) >= 2 and parts[0] in ("mem_reserve", "mem_alias"):
+                          try:
+                              vals[parts[0]] = int(parts[1], 0)
+                          except ValueError:
+                              pass
+              if vals.get("mem_reserve", 0) > IOS_LIMIT or vals.get("mem_alias", 0) > IOS_LIMIT:
+                  clamped = {"mem_reserve": "0xF0000000", "mem_alias": "0xC8000000"}
+                  seen, out = set(), []
+                  for ln in lines:
+                      s = ln.strip()
+                      if s and not s.startswith("#") and s.split()[0] in clamped:
+                          k = s.split()[0]
+                          out.append(f"{k}\t{clamped[k]}")
+                          seen.add(k)
+                      else:
+                          out.append(ln)
+                  for k, v in clamped.items():
+                      if k not in seen:
+                          out.append(f"{k}\t{v}")
+                  open(tsv, "w", encoding="utf-8").write("\n".join(out) + "\n")
+                  open(os.path.join(root, ".need_repack"), "w").write("1")
+                  print(f"[iOS UNREAL FIX] Clamped oversized provisional guest block in {tsv} -> mem_reserve 0xF0000000 / mem_alias 0xC8000000")
+          PY
 
           if [ "$ENABLE_60FPS" = "true" ]; then
             python3 - <<'PY'
