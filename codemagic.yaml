@@ -1,0 +1,611 @@
+workflows:
+  miao-ios-port:
+    name: MiaoBuildCL Universal iOS Port Builder (M2)
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    environment:
+      xcode: 27.0
+      vars:
+        CHIP_PRESET: "under_a17"
+        PACKAGING_MODE: "separate_both"
+        ENGINE_REPO: "https://github.com/LNPANDY/NX2Apple.git"
+        IPA_NAME: "GamePort_miao.ipa"
+        CREDIT_TEXT: "Port by Miaomiaocutene"
+        CREDIT_URL: "https://discord.com/users/893716299014873088"
+        TITLE_ID: "auto"
+        USE_UPDATE: "false"
+        USE_DLC: "false"
+        USE_VH: "false"
+        ENABLE_60FPS: "true"
+        ENABLE_RAM_UNLOCK: "true"
+        ENABLE_EXT_VA: "false"
+        UPLOAD_GOFILE: "true"
+    scripts:
+      - name: Free Disk Space (>190 GB on Mac mini M2)
+        script: |
+          set -euo pipefail
+          echo "=== Disk space before cleanup ==="
+          df -h /
+          rm -rf "${ANDROID_SDK_ROOT:-/usr/local/share/android-sdk}" "$HOME/Library/Android" || true
+          xcrun simctl runtime delete all || true
+          rm -rf "$HOME/Library/Caches/"* "$HOME/Library/Developer/Xcode/DerivedData/"* || true
+          brew cleanup --prune=all || true
+          echo "=== Disk space after cleanup ==="
+          df -h /
+          xcodebuild -version || true
+
+      - name: Install & Verify Build Tools + Metal Toolchain (Fail-Fast)
+        script: |
+          set -euo pipefail
+          if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+            echo "Downloading Xcode MetalToolchain..."
+            xcodebuild -downloadComponent MetalToolchain || true
+            sleep 3
+          fi
+          if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+            echo "MetalToolchain not auto-mounted; mounting DMG manually..."
+            DMG="$(find /System/Library/AssetsV2/com_apple_MobileAsset_MetalToolchain -name "*.dmg" 2>/dev/null | head -n 1 || true)"
+            if [ -n "$DMG" ]; then
+              mkdir -p /tmp/metal_mnt
+              hdiutil attach -nobrowse -readonly "$DMG" -mountpoint /tmp/metal_mnt
+              TC="$(find /tmp/metal_mnt -maxdepth 3 -name "Metal.xctoolchain" -type d | head -n 1 || true)"
+              if [ -n "$TC" ]; then
+                sudo mkdir -p /Library/Developer/Toolchains
+                sudo rm -rf /Library/Developer/Toolchains/Metal.xctoolchain
+                sudo cp -R "$TC" /Library/Developer/Toolchains/Metal.xctoolchain
+              fi
+              hdiutil detach /tmp/metal_mnt || true
+            fi
+            sudo xcodebuild -runFirstLaunch || true
+          fi
+          xcrun -sdk iphoneos metal --version || true
+
+          HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install xcodegen zstd spirv-cross glslang jq p7zip unar || true
+          for tool in xcodegen zstd spirv-cross glslangValidator jq 7z; do
+            command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: Missing required tool: $tool"; exit 1; }
+          done
+
+      - name: Setup .NET 10 SDK (arm64 + x64)
+        script: |
+          set -euo pipefail
+          curl -sSL https://dot.net/v1/dotnet-install.sh -o dotnet-install.sh
+          chmod +x dotnet-install.sh
+          ./dotnet-install.sh --channel 10.0 --architecture arm64 --install-dir "$HOME/.dotnet-arm64"
+          ./dotnet-install.sh --channel 10.0 --runtime dotnet --architecture x64 --install-dir "$HOME/.dotnet-x64"
+          rm -f dotnet-install.sh
+
+      - name: Clone Engine & Smart A16 Auto-Patch + Options + Miao Credit
+        script: |
+          set -euo pipefail
+          rm -rf src
+          git clone --depth 1 "$ENGINE_REPO" src
+          if [ -f "src/tools/engine.py" ] && [ ! -f "src/scripts/build_ipa_from_nsp.py" ]; then
+            echo "[NX2Apple] Phát hiện cấu trúc wrapper -> chạy tools/engine.py sync..."
+            (cd src && python3 tools/engine.py sync)
+            mv src src_wrapper
+            mv src_wrapper/engine src
+            rm -rf src_wrapper
+          fi
+
+          # 1. Smart A16 Auto-Patch
+          if [ "$CHIP_PRESET" = "under_a17" ]; then
+            if [ -f "src/dm/gfx/tex/bc_soft.c" ] || [ -f "src/dm/gfx/tex/nvn_bcdec.c" ]; then
+              echo "[A16 SMART] Engine đã tích hợp sẵn giải mã BC mềm cho A16."
+            else
+              echo "[A16 SMART] Kéo bộ giải mã ASTC (bc_soft) từ NXNativeWindows..."
+              git clone --depth 1 https://github.com/zenvyzenshiro/NXNativeWindows.git tmp_nxw
+              cp -v tmp_nxw/dm/gfx/tex/bc_soft.* src/dm/gfx/tex/ || true
+              python3 - <<'PY'
+          import os
+          for rel in ("src/dm/host/Makefile", "src/dm/ios/tools/build_ipa.sh"):
+              if os.path.isfile(rel):
+                  txt = open(rel, encoding="utf-8").read()
+                  if "bc_soft.c" not in txt and "tex_layout.c" in txt:
+                      txt = txt.replace("tex_layout.c", "tex_layout.c bc_soft.c", 1)
+                      open(rel, "w", encoding="utf-8").write(txt)
+                      print(f"[A16 SMART] Registered bc_soft.c in {rel}")
+          PY
+              rm -rf tmp_nxw
+            fi
+          else
+            echo "[INFO] Preset A17 Pro+ -> build nguyên bản (BC phần cứng)"
+          fi
+
+          # 2. Weak stub _nxw_show_data_help
+          if [ -f "src/dm/host/front_ios.m" ]; then
+            python3 - <<'PY'
+          path = "src/dm/host/front_ios.m"
+          code = open(path, encoding="utf-8").read()
+          if "nxw_show_data_help" in code and "miao_weak_nxw_show_data_help" not in code:
+              open(path, "w", encoding="utf-8").write(code + "\n/* miao_weak_nxw_show_data_help */\n__attribute__((weak)) void nxw_show_data_help(void) {}\n")
+              print("[PATCH] Added weak stub for nxw_show_data_help")
+          PY
+          fi
+
+          # 3. 60 FPS override
+          if [ "$ENABLE_60FPS" = "true" ] && [ -n "${TITLE_ID:-}" ] && [ "${TITLE_ID:-}" != "auto" ] && [ -f "src/dm/games/$TITLE_ID/game.tsv" ]; then
+            python3 - <<'PY'
+          import os
+          tsv = f"src/dm/games/{os.environ['TITLE_ID']}/game.tsv"
+          lines = open(tsv, encoding="utf-8").read().splitlines()
+          overrides = {"present_interval": "display", "fps_target": "60", "fps_max": "60"}
+          seen, out = set(), []
+          for ln in lines:
+              s = ln.strip()
+              if s and not s.startswith("#") and s.split()[0] in overrides:
+                  k = s.split()[0]
+                  out.append(f"{k}\t{overrides[k]}")
+                  seen.add(k)
+              else:
+                  out.append(ln)
+          for k, v in overrides.items():
+              if k not in seen:
+                  out.append(f"{k}\t{v}")
+          open(tsv, "w", encoding="utf-8").write("\n".join(out) + "\n")
+          PY
+          fi
+
+          # 4. Entitlements RAM Unlock (+ optional Extended Virtual Addressing ONLY when explicitly enabled)
+          if [ "$ENABLE_RAM_UNLOCK" = "true" ] || [ "$ENABLE_EXT_VA" = "true" ]; then
+            cat > entitlements.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          EOF
+            if [ "$ENABLE_RAM_UNLOCK" = "true" ]; then
+              echo '  <key>com.apple.developer.kernel.increased-memory-limit</key><true/>' >> entitlements.plist
+            fi
+            if [ "$ENABLE_EXT_VA" = "true" ]; then
+              echo '  <key>com.apple.developer.kernel.extended-virtual-addressing</key><true/>' >> entitlements.plist
+            fi
+            cat >> entitlements.plist <<'EOF'
+          </dict>
+          </plist>
+          EOF
+            plutil -lint entitlements.plist
+          fi
+
+          # 5. Giao diện Hồng Pastel toàn phần (giống FC27) + Credit đầu trang (icon mèo thật + mở Discord)
+          if [ -f "src/dm/ios/Sources/Launcher.swift" ]; then
+            python3 - <<'PY'
+          import os, re, shutil, subprocess
+          launcher = "src/dm/ios/Sources/Launcher.swift"
+          credit = os.environ.get("CREDIT_TEXT", "Port By Miaomiaocute nè").replace("\\", "\\\\").replace("\"", "\\\"")
+          credit_url = os.environ.get("CREDIT_URL", "https://discord.com/users/893716299014873088").strip().replace("\\", "\\\\").replace("\"", "\\\"")
+          if not credit_url:
+              credit_url = "https://discord.com/users/893716299014873088"
+          cat_b64 = "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"
+          orig = open(launcher, encoding="utf-8").read()
+          if "MiaoCreditBanner" not in orig:
+              if "import UIKit" not in orig:
+                  orig = "import UIKit\n" + orig
+              credit_defs = '''
+          private enum MiaoLauncherTheme {
+              static let pinkAccent = Color(red: 0.93, green: 0.28, blue: 0.58)
+              static let pinkTitle = Color(red: 0.72, green: 0.12, blue: 0.42)
+              static let pinkSub = Color(red: 0.85, green: 0.25, blue: 0.52)
+              static let pinkBg = Color(red: 1.0, green: 0.93, blue: 0.96)
+              static let pinkCard = Color(red: 1.0, green: 0.84, blue: 0.91)
+              static let pinkBorder = Color(red: 0.96, green: 0.55, blue: 0.74)
+              static let catB64 = "__CAT_B64__"
+              static let creditText = "__CREDIT_TEXT__"
+              static let creditURL = "__CREDIT_URL__"
+              static let catUIImage: UIImage? = {
+                  guard let data = Data(base64Encoded: catB64) else { return nil }
+                  return UIImage(data: data)
+              }()
+          }
+          
+          private struct MiaoCatIconView: View {
+              var body: some View {
+                  if let uiImg = MiaoLauncherTheme.catUIImage {
+                      Image(uiImage: uiImg)
+                          .resizable()
+                          .scaledToFill()
+                          .frame(width: 28, height: 28)
+                          .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                          .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).stroke(MiaoLauncherTheme.pinkBorder, lineWidth: 1))
+                  } else {
+                      Image(systemName: "cat.fill")
+                          .font(.title3)
+                          .foregroundColor(MiaoLauncherTheme.pinkAccent)
+                  }
+              }
+          }
+          
+          private struct MiaoCreditBanner: View {
+              var body: some View {
+                  Button {
+                      if let url = URL(string: MiaoLauncherTheme.creditURL) {
+                          UIApplication.shared.open(url)
+                      }
+                  } label: {
+                      VStack(spacing: 5) {
+                          HStack(spacing: 8) {
+                              MiaoCatIconView()
+                              Text(MiaoLauncherTheme.creditText)
+                                  .font(.title3.weight(.bold))
+                                  .foregroundColor(MiaoLauncherTheme.pinkTitle)
+                                  .multilineTextAlignment(.center)
+                          }
+                          Text("Nhấn để mở Discord")
+                              .font(.caption.weight(.semibold))
+                              .foregroundColor(MiaoLauncherTheme.pinkSub)
+                      }
+                      .frame(maxWidth: .infinity, alignment: .center)
+                      .padding(.vertical, 12)
+                      .padding(.horizontal, 14)
+                      .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(MiaoLauncherTheme.pinkCard))
+                      .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(MiaoLauncherTheme.pinkBorder, lineWidth: 1.5))
+                  }
+                  .buttonStyle(.plain)
+                  .frame(maxWidth: .infinity, alignment: .center)
+              }
+          }
+          
+          private struct MiaoPinkBackgroundModifier: ViewModifier {
+              func body(content: Content) -> some View {
+                  content
+                      .scrollContentBackground(.hidden)
+                      .background(MiaoLauncherTheme.pinkBg.ignoresSafeArea())
+                      .tint(MiaoLauncherTheme.pinkAccent)
+                      .preferredColorScheme(.light)
+              }
+          }
+          '''.replace("__CAT_B64__", cat_b64).replace("__CREDIT_TEXT__", credit).replace("__CREDIT_URL__", credit_url)
+          
+              def find_matching_brace(text, open_brace_idx):
+                  depth, i, in_str = 0, open_brace_idx, False
+                  while i < len(text):
+                      ch = text[i]
+                      if ch == "\"" and (i == 0 or text[i - 1] != "\\"):
+                          in_str = not in_str
+                      elif not in_str:
+                          if ch == "{": depth += 1
+                          elif ch == "}":
+                              depth -= 1
+                              if depth == 0: return i
+                      i += 1
+                  return -1
+          
+              patched = orig
+              # 1) Chèn Credit Banner lên ngay ĐẦU Form { hoặc List { (không bao giờ chui vào ô con)
+              for kind, pat in [("form", r"Form\s*\{"), ("list", r"List\s*\{")]:
+                  m = re.search(pat, patched)
+                  if not m: continue
+                  open_idx = m.end() - 1
+                  close_idx = find_matching_brace(patched, open_idx)
+                  if close_idx == -1: continue
+                  banner_block = (
+                      "\n            Section {\n"
+                      "                MiaoCreditBanner()\n"
+                      "            }\n"
+                      "            .listRowBackground(Color.clear)\n"
+                      "            .listRowInsets(EdgeInsets(top: 6, leading: 10, bottom: 6, trailing: 10))\n"
+                  )
+                  patched = (
+                      patched[:m.end()]
+                      + banner_block
+                      + patched[m.end():close_idx + 1]
+                      + "\n        .modifier(MiaoPinkBackgroundModifier())"
+                      + patched[close_idx + 1:]
+                  )
+                  print(f"[LAUNCHER] Injected top Credit Banner + Pastel Pink into {kind}")
+                  break
+          
+              # 2) Áp nền Hồng Pastel + nút Play Hồng cho toàn bộ struct màn hình chính (chứa Form/List hoặc Play)
+              for sm in re.finditer(r"struct\s+\w+\s*:\s*View\s*\{", patched):
+                  s_open = sm.end() - 1
+                  s_close = find_matching_brace(patched, s_open)
+                  if s_close == -1: continue
+                  s_body = patched[s_open:s_close + 1]
+                  if ("\"Play\"" in s_body or "Form" in s_body or "List" in s_body) and "miaoRootWrapped" not in s_body:
+                      bm = re.search(r"var\s+body\s*:\s*some\s+View\s*\{", s_body)
+                      if bm:
+                          b_open = s_open + bm.end() - 1
+                          b_close = find_matching_brace(patched, b_open)
+                          if b_close != -1:
+                              inner = patched[b_open + 1:b_close]
+                              wrapped = "\n        Group {" + inner + "}\n        .modifier(MiaoPinkBackgroundModifier())\n        /* miaoRootWrapped */\n    "
+                              patched = patched[:b_open + 1] + wrapped + patched[b_close:]
+                              print("[LAUNCHER] Wrapped root Launcher View with full Pastel Pink + Pink Play tint")
+                              break
+          
+              patched = patched + "\n" + credit_defs
+              bak = launcher + ".bak"
+              shutil.copy2(launcher, bak)
+              open(launcher, "w", encoding="utf-8").write(patched)
+              chk = subprocess.run(["xcrun", "swiftc", "-parse", launcher], capture_output=True, text=True)
+              if chk.returncode != 0:
+                  print("[WARN] swiftc -parse failed on patched Launcher.swift -> restoring original:", chk.stderr)
+                  shutil.move(bak, launcher)
+              else:
+                  os.remove(bak)
+                  print("[OK] Verified Pastel Pink Launcher.swift with swiftc -parse")
+          PY
+          fi
+
+          chmod +x src/dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate 2>/dev/null || true
+          chmod +x src/dm/gfx/tools/spirv_cross_bin/spirv-cross 2>/dev/null || true
+          chmod +x src/dm/tools/nx_extract_bin/nx_extract 2>/dev/null || true
+          find src -type f -name "*.sh" -exec chmod +x {} +
+
+      - name: Setup Python venv & Download Game, Update, Keys, VH
+        script: |
+          set -euo pipefail
+          python3 -m venv .venv
+          source .venv/bin/activate
+          pip install --no-cache-dir --upgrade pip
+          if [ -f src/.github/requirements/tools.txt ]; then pip install --no-cache-dir -r src/.github/requirements/tools.txt; fi
+          pip install --no-cache-dir gdown requests lz4 "capstone>=5,<6" fonttools nsz zbic pycryptodome zstandard pillow "backports.zstd; python_version < '3.14'"
+
+          test -n "$GAME_URL"
+          test -n "$KEYS_URL"
+          if [ "$USE_UPDATE" = "true" ]; then test -n "$UPDATE_URL"; fi
+          if [ "$USE_DLC" = "true" ]; then test -n "$DLC_URL"; fi
+          if [ "$USE_VH" = "true" ]; then test -n "$VH_URL"; fi
+
+          mkdir -p game_files keys_dir vh_raw out_ipa
+          curl -sSL https://raw.githubusercontent.com/ltsdw/gofile-downloader/main/gofile-downloader.py -o gofile-downloader.py
+
+          download_any() {
+            local url="$1"
+            local out_dir="$2"
+            local flatten="${3:-true}"
+            if [[ "$url" == *"gofile.io"* ]]; then
+              GF_DOWNLOAD_DIR="$out_dir" python3 gofile-downloader.py "$url"
+            elif [[ "$url" == *"drive.google.com"* ]]; then
+              if [[ "$url" == *"/folders/"* ]]; then
+                (cd "$out_dir" && gdown --folder "$url")
+              else
+                local fid
+                fid="$(echo "$url" | sed -nE 's/.*\/d\/([^\/?]+).*/\1/p; s/.*[?&]id=([^&]+).*/\1/p' | head -n 1)"
+                if [ -n "$fid" ]; then (cd "$out_dir" && gdown "https://drive.google.com/uc?id=${fid}"); else (cd "$out_dir" && gdown "$url"); fi
+              fi
+            else
+              (cd "$out_dir" && curl -fSL -O -J "$url")
+            fi
+            if [ "$flatten" = "true" ]; then
+              find "$out_dir" -mindepth 2 -type f -exec mv -f {} "$out_dir"/ \;
+              find "$out_dir" -mindepth 1 -type d -empty -delete
+            fi
+          }
+
+          extract_archive() {
+            local arc="$1"
+            local dst="$2"
+            local lower
+            lower="$(echo "$arc" | tr '[:upper:]' '[:lower:]')"
+            if [[ "$lower" == *.rar ]] && command -v unar >/dev/null 2>&1; then
+              unar -f -q -o "$dst" "$arc"
+            else
+              7z x -y "$arc" -o"$dst" >/dev/null || unar -f -q -o "$dst" "$arc"
+            fi
+            rm -f "$arc"
+          }
+
+          download_any "$KEYS_URL" "keys_dir" "true"
+          download_any "$GAME_URL" "game_files" "true"
+          if [ "$USE_UPDATE" = "true" ] && [ -n "$UPDATE_URL" ]; then download_any "$UPDATE_URL" "game_files" "true"; fi
+          while IFS= read -r -d '' arc; do
+            extract_archive "$arc" "game_files"
+          done < <(find game_files -maxdepth 2 -type f \( -iname "*.zip" -o -iname "*.rar" -o -iname "*.7z" \) -print0)
+          find game_files -mindepth 2 -type f -exec mv -f {} game_files/ \;
+          find game_files -mindepth 1 -type d -empty -delete
+          if [ "$USE_DLC" = "true" ] && [ -n "$DLC_URL" ]; then
+            mkdir -p dlc_raw
+            download_any "$DLC_URL" "dlc_raw" "false"
+            while IFS= read -r -d '' arc; do
+              extract_archive "$arc" "dlc_raw"
+            done < <(find dlc_raw -maxdepth 3 -type f \( -iname "*.zip" -o -iname "*.rar" -o -iname "*.7z" \) -print0)
+            find dlc_raw -type f \( -iname "*.nsp" -o -iname "*.xci" -o -iname "*.nsz" -o -iname "*.xcz" \) -exec mv -f {} game_files/ \;
+            rm -rf dlc_raw
+          fi
+          if [ "$USE_VH" = "true" ] && [ -n "$VH_URL" ]; then
+            download_any "$VH_URL" "vh_raw" "false"
+            mkdir -p vh_raw/unpacked
+            while IFS= read -r -d '' arc; do
+              extract_archive "$arc" "vh_raw/unpacked"
+            done < <(find vh_raw -maxdepth 3 -type f \( -iname "*.zip" -o -iname "*.rar" -o -iname "*.7z" \) -print0)
+          fi
+          df -h /
+
+      - name: Build IPA & Export Codemagic Artifacts
+        script: |
+          set -euo pipefail
+          source .venv/bin/activate
+          export DOTNET_ROOT="$HOME/.dotnet-arm64"
+          export DOTNET_ROOT_ARM64="$HOME/.dotnet-arm64"
+          export DOTNET_ROOT_X64="$HOME/.dotnet-x64"
+          export DOTNET_ROLL_FORWARD=Major
+          export PATH="$DOTNET_ROOT:$PATH"
+          export ROOT="$PWD"
+
+          PROD_KEYS="$(find "$ROOT/keys_dir" -type f -iname "*prod.keys*" | head -n 1)"
+          if [ -z "$PROD_KEYS" ]; then PROD_KEYS="$(find "$ROOT/keys_dir" -type f -iname "*.keys" | head -n 1)"; fi
+          test -n "$PROD_KEYS"
+          export PROD_KEYS
+
+          if [ -f "$ROOT/src/dm/gfx/tools/dmsh_chain.py" ]; then
+            (cd "$ROOT/src" && python3 dm/gfx/tools/dmsh_chain.py --update-lock) || true
+          fi
+
+          cat > "$ROOT/miao_env.txt" <<EOF
+          DM_ALIAS_SIZE=0x180000000
+          EOF
+
+          ENT_ENV=""
+          if [ -f "$ROOT/entitlements.plist" ]; then ENT_ENV="DM_ENTITLEMENTS=$ROOT/entitlements.plist"; fi
+          ROMFS_ARGS="--romfs separate"
+          if [ "$PACKAGING_MODE" = "bundle" ]; then ROMFS_ARGS=""; fi
+
+          HELP_OUT="$(cd "$ROOT/src" && python3 scripts/build_ipa_from_nsp.py --help 2>&1 || true)"
+          NO_HEAP_ARG=""; echo "$HELP_OUT" | grep -q -- "--no-heap-check" && NO_HEAP_ARG="--no-heap-check"
+          KEEP_EXT_ARG=""; echo "$HELP_OUT" | grep -q -- "--keep-extracted" && KEEP_EXT_ARG="--keep-extracted"
+          ENV_FILE_ARG=""; echo "$HELP_OUT" | grep -q -- "--env-file" && ENV_FILE_ARG="--env-file $ROOT/miao_env.txt"
+
+          run_nx_build() {
+            (cd "$ROOT/src" && env $ENT_ENV python3 scripts/build_ipa_from_nsp.py "$ROOT/game_files" \
+              -k "$PROD_KEYS" --allow-other-metal $NO_HEAP_ARG $KEEP_EXT_ARG $ENV_FILE_ARG $ROMFS_ARGS -o "$ROOT/out_ipa/$IPA_NAME")
+          }
+
+          run_nx_build
+          rm -f "$ROOT/.need_repack"
+
+          if [ "$ENABLE_60FPS" = "true" ]; then
+            python3 - <<'PY'
+          import os, glob
+          root = os.environ["ROOT"]
+          for tsv in glob.glob(os.path.join(root, "game_files", "*_build", "profile", "*", "game.tsv")):
+              lines = open(tsv, encoding="utf-8").read().splitlines()
+              overrides = {"present_interval": "display", "fps_target": "60", "fps_max": "60"}
+              seen, out = set(), []
+              for ln in lines:
+                  s = ln.strip()
+                  if s and not s.startswith("#") and s.split()[0] in overrides:
+                      k = s.split()[0]; out.append(f"{k}\t{overrides[k]}"); seen.add(k)
+                  else:
+                      out.append(ln)
+              for k, v in overrides.items():
+                  if k not in seen: out.append(f"{k}\t{v}")
+              open(tsv, "w", encoding="utf-8").write("\n".join(out) + "\n")
+              open(os.path.join(root, ".need_repack"), "w").write("1")
+          PY
+          fi
+
+          if [ "$USE_VH" = "true" ]; then
+            python3 - <<'PY'
+          import os, sys, glob, shutil, subprocess
+          root = os.environ["ROOT"]
+          prod_keys = os.environ["PROD_KEYS"]
+          vh_raw = os.path.join(root, "vh_raw")
+          nx_extract = os.path.join(root, "src", "dm", "tools", "nx_extract_bin", "nx_extract")
+          romfs_tool = os.path.join(root, "src", "dm", "tools", "romfs_image.py")
+          search_base = os.path.join(vh_raw, "unpacked") if os.path.isdir(os.path.join(vh_raw, "unpacked")) else vh_raw
+          vh_romfs_root = None
+          for dp, dns, _ in os.walk(search_base):
+              for d in dns:
+                  if d.lower() == "romfs":
+                      vh_romfs_root = os.path.join(dp, d); break
+              if vh_romfs_root: break
+          if not vh_romfs_root:
+              vh_romfs_root = search_base
+
+          def overlay_tree(src_root, dst_root):
+              ow, add = 0, 0
+              for dp, _, fns in os.walk(src_root):
+                  for fn in fns:
+                      if fn.startswith("._") or fn == ".DS_Store" or fn.lower().endswith((".zip", ".rar", ".7z")): continue
+                      sf = os.path.join(dp, fn)
+                      parts = os.path.relpath(sf, src_root).split(os.sep)
+                      cur = dst_root
+                      for part in parts[:-1]:
+                          m = next((e for e in os.listdir(cur) if e.lower() == part.lower() and os.path.isdir(os.path.join(cur, e))), None) if os.path.isdir(cur) else None
+                          cur = os.path.join(cur, m or part)
+                          os.makedirs(cur, exist_ok=True)
+                      tname = parts[-1]
+                      ex = False
+                      if os.path.isdir(cur):
+                          m = next((e for e in os.listdir(cur) if e.lower() == tname.lower() and os.path.isfile(os.path.join(cur, e))), None)
+                          if m: tname = m; ex = True
+                      shutil.copy2(sf, os.path.join(cur, tname))
+                      ow += 1 if ex else 0; add += 0 if ex else 1
+              return ow, add
+
+          vers = sorted(glob.glob(os.path.join(root, "game_files", "*_build", "extract", "v*")))
+          if not vers:
+              print("[VH ERROR] No extract/v* directory found.", file=sys.stderr)
+              sys.exit(1)
+          ver_dir = vers[-1]
+          romfs_dir = next((os.path.join(ver_dir, e) for e in os.listdir(ver_dir) if e.lower() == "romfs" and os.path.isdir(os.path.join(ver_dir, e))), None)
+          romfs_img = next((os.path.join(ver_dir, e) for e in os.listdir(ver_dir) if e.lower() == "romfs.img" and os.path.isfile(os.path.join(ver_dir, e))), None)
+          if romfs_dir:
+              ow, add = overlay_tree(vh_romfs_root, romfs_dir)
+              print(f"[VH] Overlaid into romfs dir: {ow} overwritten, {add} added.")
+              shutil.rmtree(vh_raw, ignore_errors=True)
+          elif romfs_img:
+              cands = sorted(set(sum([glob.glob(os.path.join(root, "game_files", p)) + glob.glob(os.path.join(root, "game_files", "*_build", "nsp", p)) for p in ("*.nsp", "*.NSP", "*.xci", "*.XCI")], [])))
+              base_pkg, upd_pkg, max_v = None, None, -1
+              for pkg in cands:
+                  out_t = subprocess.run([nx_extract, prod_keys, "--contents", pkg], capture_output=True, text=True).stdout
+                  vnum = max([int(t[1:]) for t in out_t.split() if t.startswith("v") and t[1:].isdigit()] + [0])
+                  if vnum > 0 or "Patch" in out_t:
+                      if vnum >= max_v: max_v = vnum; upd_pkg = pkg
+                  elif base_pkg is None or os.path.getsize(pkg) > os.path.getsize(base_pkg):
+                      base_pkg = pkg
+              if base_pkg is None: base_pkg = max(cands, key=os.path.getsize)
+              if upd_pkg == base_pkg: upd_pkg = None
+              stage = os.path.join(root, "vh_stage")
+              shutil.rmtree(stage, ignore_errors=True); os.makedirs(stage, exist_ok=True)
+              subprocess.run([nx_extract, prod_keys, base_pkg, upd_pkg or "-", stage], check=True)
+              s_romfs = next((os.path.join(stage, e) for e in os.listdir(stage) if e.lower() == "romfs"), None)
+              ow, add = overlay_tree(vh_romfs_root, s_romfs)
+              print(f"[VH] Overlaid into vh_stage/RomFS: {ow} overwritten, {add} added.")
+              shutil.rmtree(vh_raw, ignore_errors=True)
+              if os.path.isfile(romfs_img): os.remove(romfs_img)
+              subprocess.run([sys.executable, romfs_tool, s_romfs, romfs_img], check=True)
+              shutil.rmtree(stage, ignore_errors=True)
+          open(os.path.join(root, ".need_repack"), "w").write("1")
+          PY
+          fi
+
+          if [ -f "$ROOT/.need_repack" ]; then
+            rm -f "$ROOT/out_ipa/$IPA_NAME" "$ROOT/out_ipa/$IPA_NAME.idx"
+            run_nx_build
+          fi
+
+          if [ "$PACKAGING_MODE" = "separate_both" ]; then
+            ROMFS_IMG="$(find "$ROOT/game_files" "$ROOT/src" -maxdepth 6 -type f -iname "RomFS.img" | head -n 1)"
+            if [ -n "$ROMFS_IMG" ]; then mv -f "$ROMFS_IMG" "$ROOT/out_ipa/romfs.img"; fi
+          fi
+
+          rm -rf "$ROOT/game_files" "$ROOT/vh_raw" "$ROOT/vh_stage" ~/Library/Developer/Xcode/DerivedData
+
+          mkdir -p "$ROOT/tmp_ipa"
+          unzip -q "$ROOT/out_ipa/$IPA_NAME" -d "$ROOT/tmp_ipa"
+          PLIST="$(find "$ROOT/tmp_ipa/Payload" -maxdepth 2 -name "Info.plist" | head -n 1)"
+          if [ -n "$PLIST" ]; then
+            /usr/libexec/PlistBuddy -c "Set :NSHumanReadableCopyright $CREDIT_TEXT" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :NSHumanReadableCopyright string $CREDIT_TEXT" "$PLIST"
+            /usr/libexec/PlistBuddy -c "Set :LSSupportsGameMode true" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :LSSupportsGameMode bool true" "$PLIST"
+            /usr/libexec/PlistBuddy -c "Set :GCSupportsGameMode true" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :GCSupportsGameMode bool true" "$PLIST"
+            /usr/libexec/PlistBuddy -c "Set :LSApplicationCategoryType public.app-category.games" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :LSApplicationCategoryType string public.app-category.games" "$PLIST"
+            rm -f "$ROOT/out_ipa/$IPA_NAME"
+            (cd "$ROOT/tmp_ipa" && zip -qry "$ROOT/out_ipa/$IPA_NAME" Payload)
+          fi
+          rm -rf "$ROOT/tmp_ipa"
+          rm -f "$ROOT/out_ipa"/*.idx
+
+          if [ "$UPLOAD_GOFILE" = "true" ]; then
+            SERVERS="$(curl -s --retry 3 https://api.gofile.io/servers | jq -r '.data.servers[].name' | head -n 3)"
+            for f in "$ROOT/out_ipa"/*.ipa "$ROOT/out_ipa"/*.img; do
+              if [ -f "$f" ]; then
+                FSIZE="$(ls -lh "$f" | awk '{print $5}')"
+                LINK=""
+                for srv in $SERVERS; do
+                  for attempt in 1 2 3; do
+                    RESP="$(curl -f -sS --max-time 5400 -F "file=@${f}" "https://${srv}.gofile.io/contents/uploadfile" 2>/dev/null || true)"
+                    CAND="$(echo "$RESP" | jq -r '.data.downloadPage // empty' 2>/dev/null || true)"
+                    if [ -n "$CAND" ]; then
+                      LINK="$CAND"
+                      break
+                    fi
+                    sleep 5
+                  done
+                  [ -n "$LINK" ] && break
+                done
+                if [ -n "$LINK" ]; then
+                  echo "Uploaded $(basename "$f") (${FSIZE}) -> ${LINK}"
+                else
+                  echo "WARN: Gofile upload failed for $(basename "$f")"
+                fi
+              fi
+            done
+          fi
+          ls -lh "$ROOT/out_ipa"
+    artifacts:
+      - out_ipa/*.ipa
